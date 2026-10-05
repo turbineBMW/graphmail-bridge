@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Register a bridge account with Evolution Data Server as a WebDAV
-//! collection, so EDS discovers its calendars over CalDAV and every EDS
-//! client (GNOME Calendar, Evolution, Era, the shell's clock) shows them.
+//! Register a bridge account with Evolution Data Server: a WebDAV collection,
+//! so EDS discovers its calendars over CalDAV and every EDS client (GNOME
+//! Calendar, Evolution, Era, the shell's clock) shows them, plus the IMAP
+//! account, identity and SMTP transport below it, so mail clients that read
+//! their accounts from EDS find the bridge like any other account.
 
 use std::fs;
 use std::io::Write;
@@ -40,15 +42,22 @@ pub fn sources_dir() -> Result<PathBuf> {
     Ok(base.config_dir().join("evolution/sources"))
 }
 
-/// The collection source: EDS discovers the calendars below `/dav/` itself
-/// and authenticates as the account's email with the bridge password.
-pub fn source_file(config: &Config, account: &AccountConfig) -> String {
-    let url = format!(
-        "http://{}:{}/dav/",
-        config.server.bind, config.server.photo_port
+/// The account's sources as `(uid, keyfile)`: the collection first, then
+/// its mail account, identity and transport. `name` is the person's name
+/// for the From header.
+pub fn sources(config: &Config, account: &AccountConfig, name: &str) -> Vec<(String, String)> {
+    let uid = source_uid(account);
+    let bind = config.server.bind;
+    let url = format!("http://{bind}:{}/dav/", config.server.photo_port);
+    let display_name = keyfile_value(&display_name(account));
+    let email = keyfile_value(&account.email);
+    let name = keyfile_value(name);
+    let (mail_uid, identity_uid, transport_uid) = (
+        format!("{uid}-mail"),
+        format!("{uid}-identity"),
+        format!("{uid}-transport"),
     );
-    let display_name = display_name(account);
-    format!(
+    let collection = format!(
         "[Data Source]\n\
          DisplayName={display_name}\n\
          Enabled=true\n\
@@ -59,7 +68,7 @@ pub fn source_file(config: &Config, account: &AccountConfig) -> String {
          Identity={email}\n\
          CalendarEnabled=true\n\
          ContactsEnabled=false\n\
-         MailEnabled=false\n\
+         MailEnabled=true\n\
          CalendarUrl={url}\n\
          ContactsUrl=\n\
          AllowSourcesRename=false\n\
@@ -77,10 +86,78 @@ pub fn source_file(config: &Config, account: &AccountConfig) -> String {
          \n\
          [WebDAV Backend]\n\
          SslTrust=\n\
-         AvoidIfmatch=false\n",
-        email = keyfile_value(&account.email),
-        display_name = keyfile_value(&display_name),
-    )
+         AvoidIfmatch=false\n"
+    );
+    // An empty IMAP method is EDS's plain password (LOGIN), the only one
+    // the bridge's IMAP server offers.
+    let mail = format!(
+        "[Data Source]\n\
+         DisplayName={display_name}\n\
+         Enabled=true\n\
+         Parent={uid}\n\
+         \n\
+         [Mail Account]\n\
+         BackendName=imapx\n\
+         IdentityUid={identity_uid}\n\
+         \n\
+         [Authentication]\n\
+         Host={bind}\n\
+         Port={imap_port}\n\
+         User={email}\n\
+         Method=\n\
+         RememberPassword=true\n\
+         ProxyUid=system-proxy\n\
+         \n\
+         [Security]\n\
+         Method=none\n\
+         \n\
+         [Imapx Backend]\n\
+         UseIdle=true\n",
+        imap_port = config.server.imap_port,
+    );
+    // Graph files a copy of everything sent, so clients must not append
+    // one to Sent themselves.
+    let identity = format!(
+        "[Data Source]\n\
+         DisplayName={display_name}\n\
+         Enabled=true\n\
+         Parent={uid}\n\
+         \n\
+         [Mail Identity]\n\
+         Address={email}\n\
+         Name={name}\n\
+         \n\
+         [Mail Submission]\n\
+         TransportUid={transport_uid}\n\
+         UseSentFolder=false\n"
+    );
+    let transport = format!(
+        "[Data Source]\n\
+         DisplayName={display_name}\n\
+         Enabled=true\n\
+         Parent={uid}\n\
+         \n\
+         [Authentication]\n\
+         Host={bind}\n\
+         Port={smtp_port}\n\
+         User={email}\n\
+         Method=PLAIN\n\
+         RememberPassword=true\n\
+         ProxyUid=system-proxy\n\
+         \n\
+         [Security]\n\
+         Method=none\n\
+         \n\
+         [Mail Transport]\n\
+         BackendName=smtp\n",
+        smtp_port = config.server.smtp_port,
+    );
+    vec![
+        (uid, collection),
+        (mail_uid, mail),
+        (identity_uid, identity),
+        (transport_uid, transport),
+    ]
 }
 
 /// GKeyFile escapes for a value on one line.
@@ -162,14 +239,33 @@ mod tests {
     }
 
     #[test]
-    fn source_points_eds_at_the_dav_root() {
-        let text = source_file(&Config::default(), &account());
-        assert!(text.contains("BackendName=webdav\n"));
-        assert!(text.contains("CalendarUrl=http://127.0.0.1:1180/dav/\n"));
-        assert!(text.contains("Identity=me@example.com\n"));
-        assert!(text.contains("User=me@example.com\n"));
-        assert!(text.contains("[Security]\nMethod=none\n"));
-        assert!(text.contains("DisplayName=Work Mail (Microsoft 365)\n"));
+    fn sources_cover_calendars_and_mail() {
+        let sources = sources(&Config::default(), &account(), "Jane Doe");
+        let uids: Vec<&str> = sources.iter().map(|(uid, _)| uid.as_str()).collect();
+        assert_eq!(
+            uids,
+            [
+                "graphmail-bridge-work-mail",
+                "graphmail-bridge-work-mail-mail",
+                "graphmail-bridge-work-mail-identity",
+                "graphmail-bridge-work-mail-transport"
+            ]
+        );
+        let (collection, mail, identity, transport) =
+            (&sources[0].1, &sources[1].1, &sources[2].1, &sources[3].1);
+        assert!(collection.contains("BackendName=webdav\n"));
+        assert!(collection.contains("CalendarUrl=http://127.0.0.1:1180/dav/\n"));
+        assert!(collection.contains("MailEnabled=true\n"));
+        assert!(collection.contains("DisplayName=Work Mail (Microsoft 365)\n"));
+        assert!(mail.contains("Parent=graphmail-bridge-work-mail\n"));
+        assert!(mail.contains("IdentityUid=graphmail-bridge-work-mail-identity\n"));
+        assert!(mail.contains("Host=127.0.0.1\nPort=1143\n"));
+        assert!(identity.contains("Address=me@example.com\nName=Jane Doe\n"));
+        assert!(identity.contains("TransportUid=graphmail-bridge-work-mail-transport\n"));
+        assert!(transport.contains("Port=1025\n"));
+        for text in [collection, mail, transport] {
+            assert!(text.contains("[Security]\nMethod=none\n"));
+        }
     }
 
     #[test]

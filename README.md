@@ -220,9 +220,11 @@ Server client:
 graphmail-bridge eds-setup
 ```
 
-This writes `~/.config/evolution/sources/graphmail-bridge-<account>.source`, a
-WebDAV collection pointing at the bridge, and stores the bridge password in the
-keyring where EDS looks for it. EDS then discovers the calendars itself. If they
+This writes `~/.config/evolution/sources/graphmail-bridge-<account>*.source`: a
+WebDAV collection pointing at the bridge, and below it the bridge's IMAP account,
+mail identity and SMTP transport, so Evolution and other clients that take their
+accounts from EDS (such as Rustle) find the mailbox too. The bridge password goes
+in the keyring where EDS looks for it. EDS then discovers the calendars itself. If they
 do not appear, run `systemctl --user restart evolution-source-registry`.
 `graphmail-bridge eds-setup --remove` undoes both.
 

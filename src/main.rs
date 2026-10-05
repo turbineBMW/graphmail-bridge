@@ -75,8 +75,9 @@ enum Commands {
         #[arg(long)]
         end: DateTime<Utc>,
     },
-    /// Register an account's calendars with Evolution Data Server (GNOME
-    /// Calendar, Evolution and other EDS clients) over CalDAV.
+    /// Register an account with Evolution Data Server: its calendars over
+    /// CalDAV and its IMAP/SMTP mail, for GNOME Calendar, Evolution, Rustle
+    /// and other EDS clients.
     EdsSetup {
         /// Account name or email. Optional when only one account is configured.
         account: Option<String>,
@@ -141,7 +142,9 @@ async fn main() -> Result<()> {
             start,
             end,
         } => calendar_events(&paths, account.as_deref(), start, end).await,
-        Commands::EdsSetup { account, remove } => eds_setup(&paths, account.as_deref(), remove),
+        Commands::EdsSetup { account, remove } => {
+            eds_setup(&paths, account.as_deref(), remove).await
+        }
         Commands::ClientConfig { account } => print_client_config(&paths, account.as_deref()),
         Commands::InstallService { no_start } => install_service(&paths, !no_start),
         Commands::UninstallService => uninstall_service(&paths),
@@ -470,30 +473,47 @@ fn print_client_config(paths: &AppPaths, account_name: Option<&str>) -> Result<(
     Ok(())
 }
 
-fn eds_setup(paths: &AppPaths, account_name: Option<&str>, remove: bool) -> Result<()> {
+async fn eds_setup(paths: &AppPaths, account_name: Option<&str>, remove: bool) -> Result<()> {
     let config = Config::load(paths)?;
     let account = resolve_account(&config, account_name)?;
     let uid = eds::source_uid(account);
     let directory = eds::sources_dir()?;
     if remove {
-        let path = directory.join(format!("{uid}.source"));
-        if path.exists() {
-            fs::remove_file(&path)
-                .with_context(|| format!("could not remove {}", path.display()))?;
+        for (source_uid, _) in eds::sources(&config, account, "") {
+            let path = directory.join(format!("{source_uid}.source"));
+            if path.exists() {
+                fs::remove_file(&path)
+                    .with_context(|| format!("could not remove {}", path.display()))?;
+            }
         }
         eds::clear_password(&uid)?;
         println!("Removed {} from Evolution Data Server.", account.email);
         return Ok(());
     }
-    let secrets = SecretStore::new(config.secrets.backend, paths).load(&account.name)?;
+    let store = SecretStore::new(config.secrets.backend, paths);
+    let secrets = store.load(&account.name)?;
+    // The From name comes from the directory; the short account name is a
+    // fallback when Graph cannot be reached.
+    let manager = Arc::new(TokenManager::from_store(account, &store)?);
+    let name = match GraphClient::new(manager).profile().await {
+        Ok(profile) => profile.display_name.unwrap_or_else(|| account.name.clone()),
+        Err(error) => {
+            eprintln!("note: could not read your name from Microsoft Graph ({error:#})");
+            account.name.clone()
+        }
+    };
     eds::store_password(&uid, &eds::display_name(account), &secrets.bridge_password)?;
-    let path = eds::install(&directory, &uid, &eds::source_file(&config, account))?;
+    // Children first, so the collection never points at missing sources.
+    let sources = eds::sources(&config, account, &name);
+    for (source_uid, contents) in sources.iter().rev() {
+        eds::install(&directory, source_uid, contents)?;
+    }
     println!(
-        "Registered {} with Evolution Data Server ({}).\n\
-         Its calendars are served while the bridge runs. If they do not appear,\n\
-         restart the registry: systemctl --user restart evolution-source-registry",
+        "Registered {} with Evolution Data Server (calendars and mail, in {}).\n\
+         Calendars are served while the bridge runs. If the account does not\n\
+         appear, restart the registry: systemctl --user restart evolution-source-registry",
         account.email,
-        path.display()
+        directory.display()
     );
     Ok(())
 }
