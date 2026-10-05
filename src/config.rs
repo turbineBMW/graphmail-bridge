@@ -121,6 +121,13 @@ pub struct SyncConfig {
     /// index is complete, until the body cache is full.
     #[serde(default)]
     pub download_bodies: bool,
+    /// Seconds between checks of every calendar for changed events.
+    #[serde(default = "default_calendar_poll_secs")]
+    pub calendar_poll_secs: u64,
+    /// Events that ended more than this many days ago are not served over
+    /// CalDAV (recurring series always are); 0 serves everything.
+    #[serde(default = "default_calendar_past_days")]
+    pub calendar_past_days: u32,
 }
 
 impl Default for SyncConfig {
@@ -132,6 +139,8 @@ impl Default for SyncConfig {
             page_delay_ms: default_page_delay_ms(),
             body_cache_max_mb: default_body_cache_max_mb(),
             download_bodies: false,
+            calendar_poll_secs: default_calendar_poll_secs(),
+            calendar_past_days: default_calendar_past_days(),
         }
     }
 }
@@ -156,6 +165,14 @@ const fn default_page_size() -> u32 {
 
 const fn default_page_delay_ms() -> u64 {
     250
+}
+
+const fn default_calendar_poll_secs() -> u64 {
+    300
+}
+
+const fn default_calendar_past_days() -> u32 {
+    365
 }
 
 const fn default_body_cache_max_mb() -> u64 {
@@ -230,7 +247,7 @@ pub fn default_scopes() -> Vec<String> {
         "https://graph.microsoft.com/User.Read",
         "https://graph.microsoft.com/Mail.ReadWrite",
         "https://graph.microsoft.com/Mail.Send",
-        "https://graph.microsoft.com/Calendars.Read",
+        "https://graph.microsoft.com/Calendars.ReadWrite",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -297,7 +314,10 @@ impl Config {
         if !(1..=500).contains(&self.sync.page_size) {
             bail!("sync.page_size must be between 1 and 500");
         }
-        if self.sync.inbox_poll_secs < 15 || self.sync.folder_poll_secs < 15 {
+        if self.sync.inbox_poll_secs < 15
+            || self.sync.folder_poll_secs < 15
+            || self.sync.calendar_poll_secs < 15
+        {
             bail!("sync poll intervals must be at least 15 seconds");
         }
         if self.sync.body_cache_max_mb < 64 {

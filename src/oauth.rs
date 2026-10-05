@@ -399,6 +399,29 @@ fn secure_http_client() -> reqwest::Client {
         .expect("TLS HTTP client construction should succeed")
 }
 
+/// The delegated permissions (`scp` claim) an access token carries. Graph
+/// tokens are JWTs; the claim is read without verifying the signature,
+/// which only Graph itself needs to do.
+pub fn token_scopes(access_token: &str) -> Vec<String> {
+    use base64::Engine;
+    let Some(payload) = access_token.split('.').nth(1) else {
+        return Vec::new();
+    };
+    let Ok(bytes) =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('='))
+    else {
+        return Vec::new();
+    };
+    #[derive(Deserialize)]
+    struct Claims {
+        #[serde(default)]
+        scp: String,
+    }
+    serde_json::from_slice::<Claims>(&bytes)
+        .map(|claims| claims.scp.split_whitespace().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,6 +436,18 @@ mod tests {
             client_id: MICROSOFT_OFFICE_CLIENT_ID.into(),
             scopes: default_scopes(),
         }
+    }
+
+    #[test]
+    fn reads_scopes_from_the_token_payload() {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"scp":"Mail.Read Calendars.ReadWrite"}"#);
+        assert_eq!(
+            token_scopes(&format!("header.{payload}.signature")),
+            ["Mail.Read", "Calendars.ReadWrite"]
+        );
+        assert!(token_scopes("opaque").is_empty());
     }
 
     #[test]

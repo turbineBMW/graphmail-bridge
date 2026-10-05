@@ -8,6 +8,7 @@ use base64::Engine;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use crate::calendar::model::{Calendar, EVENT_FIELDS, Event};
 use crate::oauth::TokenManager;
 
 const GRAPH_ROOT: &str = "https://graph.microsoft.com/v1.0";
@@ -821,6 +822,179 @@ impl GraphClient {
         }
         unreachable!("retry loop always returns")
     }
+}
+
+/// The version stamp of one event in a calendar listing.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventKey {
+    pub id: String,
+    #[serde(default)]
+    pub change_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelledOccurrences {
+    #[serde(default)]
+    cancelled_occurrences: Option<Vec<String>>,
+}
+
+/// Bodies are served to calendar clients as plain text.
+const TEXT_BODIES: &str = "outlook.body-content-type=\"text\"";
+
+impl GraphClient {
+    pub async fn calendars(&self) -> Result<Vec<Calendar>> {
+        self.get_all(format!(
+            "{GRAPH_ROOT}/me/calendars?$top=100&$select=id,name,hexColor,canEdit,isDefaultCalendar"
+        ))
+        .await
+    }
+
+    /// `id` + `changeKey` of every single event and series master in a
+    /// calendar, limited to series and to events ending after `since`.
+    pub async fn calendar_event_keys(
+        &self,
+        calendar_id: &str,
+        since: Option<&str>,
+    ) -> Result<Vec<EventKey>> {
+        self.get_all(calendar_events_url(calendar_id, "id,changeKey", since))
+            .await
+    }
+
+    /// Full events of a calendar, under the same limits as
+    /// [`Self::calendar_event_keys`].
+    pub async fn calendar_events(
+        &self,
+        calendar_id: &str,
+        since: Option<&str>,
+    ) -> Result<Vec<Event>> {
+        let mut url = calendar_events_url(calendar_id, EVENT_FIELDS, since);
+        let mut values = Vec::new();
+        loop {
+            let request = self
+                .request(Method::GET, &url)
+                .await?
+                .header("Prefer", TEXT_BODIES);
+            let page: GraphPage<Event> = decode_json(self.send(request).await?).await?;
+            values.extend(page.value);
+            match page.next_link {
+                Some(next) => url = next,
+                None => return Ok(values),
+            }
+        }
+    }
+
+    /// One event, or `None` when it no longer exists.
+    pub async fn event(&self, event_id: &str) -> Result<Option<Event>> {
+        let url = format!(
+            "{GRAPH_ROOT}/me/events/{}?$select={EVENT_FIELDS}",
+            encode_segment(event_id)
+        );
+        let request = self
+            .request(Method::GET, &url)
+            .await?
+            .header("Prefer", TEXT_BODIES);
+        let response = self.send_raw(request).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(decode_json(response).await?))
+    }
+
+    /// `OID.<id>.<date>` markers of a series' cancelled occurrences.
+    pub async fn cancelled_occurrences(&self, master_id: &str) -> Result<Vec<String>> {
+        let url = format!(
+            "{GRAPH_ROOT}/me/events/{}?$select=cancelledOccurrences",
+            encode_segment(master_id)
+        );
+        let found: CancelledOccurrences = self.get_json(&url).await?;
+        Ok(found.cancelled_occurrences.unwrap_or_default())
+    }
+
+    /// Every instance of a series in a UTC window (occurrences and
+    /// exceptions; cancelled ones are absent).
+    pub async fn instances(&self, master_id: &str, start: &str, end: &str) -> Result<Vec<Event>> {
+        let mut url = format!(
+            "{GRAPH_ROOT}/me/events/{}/instances?startDateTime={}&endDateTime={}&$top=500&$select={EVENT_FIELDS}",
+            encode_segment(master_id),
+            encode_query(start),
+            encode_query(end)
+        );
+        let mut values = Vec::new();
+        loop {
+            let request = self
+                .request(Method::GET, &url)
+                .await?
+                .header("Prefer", TEXT_BODIES);
+            let page: GraphPage<Event> = decode_json(self.send(request).await?).await?;
+            values.extend(page.value);
+            match page.next_link {
+                Some(next) => url = next,
+                None => return Ok(values),
+            }
+        }
+    }
+
+    pub async fn create_event(
+        &self,
+        calendar_id: &str,
+        event: &serde_json::Value,
+    ) -> Result<Event> {
+        let url = format!(
+            "{GRAPH_ROOT}/me/calendars/{}/events",
+            encode_segment(calendar_id)
+        );
+        let request = self.request(Method::POST, &url).await?.json(event);
+        decode_json(self.send(request).await?).await
+    }
+
+    pub async fn update_event(&self, event_id: &str, patch: &serde_json::Value) -> Result<()> {
+        let url = format!("{GRAPH_ROOT}/me/events/{}", encode_segment(event_id));
+        let request = self.request(Method::PATCH, &url).await?.json(patch);
+        self.send(request).await?;
+        Ok(())
+    }
+
+    /// Delete an event. One that is already gone counts as deleted.
+    pub async fn delete_event(&self, event_id: &str) -> Result<()> {
+        let url = format!("{GRAPH_ROOT}/me/events/{}", encode_segment(event_id));
+        let request = self.request(Method::DELETE, &url).await?;
+        let response = self.send_raw(request).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        checked(response).await?;
+        Ok(())
+    }
+
+    /// Answer an invitation: `action` is `accept`, `tentativelyAccept` or
+    /// `decline`.
+    pub async fn respond_to_event(&self, event_id: &str, action: &str) -> Result<()> {
+        let url = format!(
+            "{GRAPH_ROOT}/me/events/{}/{action}",
+            encode_segment(event_id)
+        );
+        let request = self
+            .request(Method::POST, &url)
+            .await?
+            .json(&serde_json::json!({ "sendResponse": true }));
+        self.send(request).await?;
+        Ok(())
+    }
+}
+
+fn calendar_events_url(calendar_id: &str, select: &str, since: Option<&str>) -> String {
+    let mut url = format!(
+        "{GRAPH_ROOT}/me/calendars/{}/events?$top=250&$select={select}",
+        encode_segment(calendar_id)
+    );
+    if let Some(since) = since {
+        let filter = format!("type eq 'seriesMaster' or end/dateTime ge '{since}'");
+        url.push_str("&$filter=");
+        url.push_str(&encode_query(&filter));
+    }
+    url
 }
 
 async fn decode_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T> {

@@ -1,7 +1,7 @@
 # graphmail-bridge
 
 `graphmail-bridge` is a small Rust daemon that exposes a Microsoft 365 mailbox
-as local IMAP and SMTP services. It talks to Microsoft Graph over HTTPS and lets
+as local IMAP and SMTP services, and its calendars over CalDAV. It talks to Microsoft Graph over HTTPS and lets
 an ordinary Linux mail client connect to `127.0.0.1`.
 
 This is an experimental 0.1 implementation, not yet a drop-in replacement for
@@ -34,6 +34,9 @@ guided OAuth setup, no Java runtime, and a native systemd user service.
 - Multiple accounts, selected by the IMAP/SMTP username
 - A hardened `systemd --user` service generated from the installed binary path
 - A SQLite UID cache using Graph immutable message IDs
+- Read-write CalDAV for every calendar in the mailbox, registered with
+  Evolution Data Server by one command so GNOME Calendar, Evolution and other
+  EDS clients show it (see [Calendars over CalDAV](#calendars-over-caldav))
 - Read-only JSON calendar export for a requested UTC window
 
 ## Microsoft authentication profiles
@@ -54,7 +57,9 @@ Microsoft can change the first-party registration at any time.
 
 The `custom-entra` profile retains the conventional v2 OAuth flow for users who
 have an approved public-client application. That app needs delegated
-`Mail.ReadWrite`, `Mail.Send`, `User.Read`, and `Calendars.Read` permissions.
+`Mail.ReadWrite`, `Mail.Send`, `User.Read`, and `Calendars.ReadWrite` permissions
+(`Calendars.Read` is enough for read-only calendars; `doctor` reports which one
+the token carries).
 
 Microsoft references:
 
@@ -107,7 +112,7 @@ graphmail-bridge calendar-events \
 ```
 
 Commands that act on a single account (`login`, `client-config`,
-`calendar-events`) take an optional account name or email. With one account
+`calendar-events`, `eds-setup`) take an optional account name or email. With one account
 configured they use it; with several they ask which one, or name it directly:
 `graphmail-bridge client-config work`.
 
@@ -161,6 +166,8 @@ page_size = 300            # messages per delta page (1..=500)
 page_delay_ms = 250        # pause between pages during the initial sync
 body_cache_max_mb = 2048   # LRU cap for cached MIME bodies
 download_bodies = false    # prefetch all bodies (newest first) once indexed
+calendar_poll_secs = 300   # how often calendars are checked for changes
+calendar_past_days = 365   # past events served over CalDAV (0 = all)
 ```
 
 `graphmail-bridge sync-status` shows each folder's progress, local and remote
@@ -180,6 +187,7 @@ password and exact ports. The defaults are:
 | IMAP server | `127.0.0.1:1143`, no transport security |
 | SMTP server | `127.0.0.1:1025`, no transport security, password auth |
 | Profile photos | `http://127.0.0.1:1180/photo?address=<email>`, HTTP Basic auth |
+| CalDAV | `http://127.0.0.1:1180/dav/`, HTTP Basic auth |
 
 ### Profile photos
 
@@ -197,6 +205,56 @@ allow reading other users' photos the endpoint simply answers `404`.
 curl -u you@example.com:BRIDGE_PASSWORD \
   "http://127.0.0.1:1180/photo?address=colleague@example.com" -o photo.jpg
 ```
+
+## Calendars over CalDAV
+
+The HTTP port also serves CalDAV at `http://127.0.0.1:1180/dav/`, with the same
+username and bridge password as IMAP. Every calendar in the mailbox becomes a
+CalDAV collection (read-only where Outlook does not allow edits, such as
+Birthdays and holiday calendars) with Outlook's colour.
+
+To show the calendars in GNOME Calendar, Evolution, or any other Evolution Data
+Server client:
+
+```console
+graphmail-bridge eds-setup
+```
+
+This writes `~/.config/evolution/sources/graphmail-bridge-<account>.source`, a
+WebDAV collection pointing at the bridge, and stores the bridge password in the
+keyring where EDS looks for it. EDS then discovers the calendars itself. If they
+do not appear, run `systemctl --user restart evolution-source-registry`.
+`graphmail-bridge eds-setup --remove` undoes both.
+
+Other CalDAV clients can use the URL directly; the server supports
+`.well-known/caldav` discovery, `calendar-query`, `calendar-multiget`, and
+`sync-collection`.
+
+How it maps:
+
+- A background task checks every calendar each `sync.calendar_poll_secs`
+  (default 300) by listing event change keys, and fetches only the events that
+  changed. Events that ended more than `sync.calendar_past_days` (default 365;
+  0 for all) ago are left out; recurring series are always included.
+- A recurring series is one object: the master with an `RRULE`, an `EXDATE` per
+  cancelled occurrence, and an override per changed occurrence. Times keep the
+  series' own time zone, so daylight-saving changes land where Outlook puts
+  them.
+- Edits are sent to Graph as the difference from the copy last served, so
+  fields a client cannot represent (HTML bodies, Teams details, attendees it did
+  not touch) are left alone. Moving or cancelling one occurrence, adding
+  attendees, reminders, free/busy, privacy and categories are supported.
+  Adding attendees makes Exchange send them invitations, as Outlook does, and
+  deleting a meeting you organise sends a cancellation.
+  Changing your own participation status on an invitation accepts, tentatively
+  accepts, or declines it through Graph, which notifies the organizer.
+- Only the organizer can move or rename a meeting; for invitations from others
+  only your response, reminder, categories and free/busy are written.
+- Graph cannot store every iCalendar rule (for example hourly repeats or "last
+  day of the month"); such objects are refused with a `403` naming the problem.
+
+Writes need `Calendars.ReadWrite`; `graphmail-bridge doctor` reports whether the
+token carries it. `graphmail-bridge sync-status` lists each calendar's state.
 
 The lack of transport TLS is intentional only because the listeners are
 strictly loopback-only. The program refuses a non-loopback bind address.
@@ -237,8 +295,7 @@ administrator revokes consent or a refresh token expires.
   newest 500 messages and SEARCH is unavailable for it. Check progress with
   `graphmail-bridge sync-status`. (`server.message_limit` is deprecated and only
   sizes that bootstrap listing.)
-- Shared/delegated mailboxes, calendar mutation/CalDAV, contacts, Exchange
-  categories, S/MIME authoring, and NTLM/EWS emulation are not implemented.
+- Shared/delegated mailboxes, CardDAV contacts, Exchange categories, S/MIME authoring, and NTLM/EWS emulation are not implemented.
 - The service needs network access and, with the default credential backend, an
   unlocked desktop keyring.
 - The `microsoft-office` compatibility profile depends on a Microsoft-owned app

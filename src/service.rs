@@ -20,6 +20,9 @@ pub struct AccountRuntime {
     pub config: AccountConfig,
     pub token_manager: Arc<TokenManager>,
     pub graph: GraphClient,
+    /// Held while a calendar is synced or written, so a sync never stores a
+    /// copy older than a write that raced it.
+    pub calendar_lock: tokio::sync::Mutex<()>,
 }
 
 pub struct Runtime {
@@ -46,6 +49,7 @@ impl Runtime {
                 config: account.clone(),
                 graph: GraphClient::new(token_manager.clone()),
                 token_manager,
+                calendar_lock: tokio::sync::Mutex::new(()),
             });
             accounts.insert(account.name.to_ascii_lowercase(), runtime.clone());
             accounts.insert(account.email.to_ascii_lowercase(), runtime.clone());
@@ -93,16 +97,17 @@ pub async fn serve(runtime: Arc<Runtime>) -> Result<()> {
         .await
         .with_context(|| format!("could not listen on {bind}:{}", photo_address.1))?;
     tracing::info!(address = %imap_listener.local_addr()?, "IMAP ready");
-    tracing::info!(address = %photo_listener.local_addr()?, "photo HTTP ready");
+    tracing::info!(address = %photo_listener.local_addr()?, "HTTP (photos, CalDAV) ready");
     tracing::info!(address = %smtp_listener.local_addr()?, "SMTP ready");
     for account in runtime.accounts() {
         crate::sync::spawn(runtime.clone(), account.clone());
+        crate::calendar::sync::spawn(runtime.clone(), account.clone());
     }
 
     tokio::try_join!(
         crate::imap::serve(imap_listener, runtime.clone()),
         crate::smtp::serve(smtp_listener, runtime.clone()),
-        crate::photos::serve(photo_listener, runtime),
+        crate::http::serve(photo_listener, runtime),
     )?;
     Ok(())
 }

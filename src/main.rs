@@ -14,8 +14,9 @@ use graphmail_bridge::config::{
     AccountConfig, AppPaths, AuthProfile, Config, MICROSOFT_OFFICE_CLIENT_ID, SecretBackend,
     default_scopes,
 };
+use graphmail_bridge::eds;
 use graphmail_bridge::graph::GraphClient;
-use graphmail_bridge::oauth::{TokenManager, device_login};
+use graphmail_bridge::oauth::{TokenManager, device_login, token_scopes};
 use graphmail_bridge::secrets::SecretStore;
 use graphmail_bridge::service::{Runtime, install_user_unit};
 use graphmail_bridge::store::Store;
@@ -74,6 +75,15 @@ enum Commands {
         #[arg(long)]
         end: DateTime<Utc>,
     },
+    /// Register an account's calendars with Evolution Data Server (GNOME
+    /// Calendar, Evolution and other EDS clients) over CalDAV.
+    EdsSetup {
+        /// Account name or email. Optional when only one account is configured.
+        account: Option<String>,
+        /// Unregister the account instead.
+        #[arg(long)]
+        remove: bool,
+    },
     /// Print settings to enter in a local mail client.
     ClientConfig {
         /// Account name or email. Optional when only one account is configured.
@@ -131,6 +141,7 @@ async fn main() -> Result<()> {
             start,
             end,
         } => calendar_events(&paths, account.as_deref(), start, end).await,
+        Commands::EdsSetup { account, remove } => eds_setup(&paths, account.as_deref(), remove),
         Commands::ClientConfig { account } => print_client_config(&paths, account.as_deref()),
         Commands::InstallService { no_start } => install_service(&paths, !no_start),
         Commands::UninstallService => uninstall_service(&paths),
@@ -273,17 +284,29 @@ async fn doctor(paths: &AppPaths, refresh: bool) -> Result<()> {
             if refresh {
                 manager.refresh_access_token().await?;
             }
+            let scopes = token_scopes(&manager.access_token().await?);
             let graph = GraphClient::new(manager);
             let profile = graph.profile().await?;
             let folder_count = graph.folders().await?.len();
-            Result::<_>::Ok((profile, folder_count))
+            Result::<_>::Ok((profile, folder_count, scopes))
         }
         .await;
         match result {
-            Ok((profile, folders)) => println!(
-                "OK  {}: {} ({:?}, {folders} top-level folders)",
-                account.name, profile.user_principal_name, account.auth_profile
-            ),
+            Ok((profile, folders, scopes)) => {
+                println!(
+                    "OK  {}: {} ({:?}, {folders} top-level folders)",
+                    account.name, profile.user_principal_name, account.auth_profile
+                );
+                let has = |scope: &str| scopes.iter().any(|granted| granted == scope);
+                let calendars = if has("Calendars.ReadWrite") {
+                    "OK  calendars: read and write (CalDAV edits reach Microsoft 365)"
+                } else if has("Calendars.Read") {
+                    "--  calendars: read only (Calendars.ReadWrite not granted; CalDAV edits will fail)"
+                } else {
+                    "--  calendars: no access granted (CalDAV calendars stay empty)"
+                };
+                println!("{calendars}");
+            }
             Err(error) => {
                 failures += 1;
                 println!("ERR {}: {error:#}", account.name);
@@ -294,8 +317,10 @@ async fn doctor(paths: &AppPaths, refresh: bool) -> Result<()> {
         bail!("{failures} account check(s) failed");
     }
     println!(
-        "OK  IMAP 127.0.0.1:{} / SMTP 127.0.0.1:{} / photos http://127.0.0.1:{}/photo",
-        config.server.imap_port, config.server.smtp_port, config.server.photo_port
+        "OK  IMAP 127.0.0.1:{} / SMTP 127.0.0.1:{} / photos http://127.0.0.1:{port}/photo / CalDAV http://127.0.0.1:{port}/dav/",
+        config.server.imap_port,
+        config.server.smtp_port,
+        port = config.server.photo_port
     );
     if paths.cache_db.exists() {
         let store = Store::open(&paths.cache_db)?;
@@ -388,6 +413,33 @@ fn sync_status(paths: &AppPaths) -> Result<()> {
             }
         }
     }
+    for account in &config.accounts {
+        let calendars = store.calendar_status(&account.name)?;
+        if calendars.is_empty() {
+            continue;
+        }
+        println!("{} calendars:", account.name);
+        for calendar in calendars {
+            let last = calendar
+                .last_sync
+                .and_then(|ts| chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0))
+                .map(|ts| ts.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "never".to_owned());
+            println!(
+                "  {:<32} {:>6} objects  {:<10}  last {last}",
+                calendar.name,
+                calendar.objects,
+                if calendar.can_edit {
+                    "read-write"
+                } else {
+                    "read-only"
+                }
+            );
+            if let Some(error) = calendar.last_error {
+                println!("      last error: {error}");
+            }
+        }
+    }
     let (bytes, rows) = store.body_cache_stats()?;
     println!(
         "body cache: {rows} messages, {:.1} MiB of {} MiB",
@@ -407,12 +459,41 @@ fn print_client_config(paths: &AppPaths, account_name: Option<&str>) -> Result<(
          Password: {}\n\
          IMAP:     127.0.0.1:{}  Security: None\n\
          SMTP:     127.0.0.1:{}  Security: None  Authentication: Password\n\
-         Photos:   http://127.0.0.1:{}/photo?address=<email>  (HTTP Basic, same credentials)",
+         Photos:   http://127.0.0.1:{port}/photo?address=<email>  (HTTP Basic, same credentials)\n\
+         CalDAV:   http://127.0.0.1:{port}/dav/  (same credentials; `graphmail-bridge eds-setup` registers it with GNOME)",
         account.email,
         secrets.bridge_password,
         config.server.imap_port,
         config.server.smtp_port,
-        config.server.photo_port
+        port = config.server.photo_port
+    );
+    Ok(())
+}
+
+fn eds_setup(paths: &AppPaths, account_name: Option<&str>, remove: bool) -> Result<()> {
+    let config = Config::load(paths)?;
+    let account = resolve_account(&config, account_name)?;
+    let uid = eds::source_uid(account);
+    let directory = eds::sources_dir()?;
+    if remove {
+        let path = directory.join(format!("{uid}.source"));
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("could not remove {}", path.display()))?;
+        }
+        eds::clear_password(&uid)?;
+        println!("Removed {} from Evolution Data Server.", account.email);
+        return Ok(());
+    }
+    let secrets = SecretStore::new(config.secrets.backend, paths).load(&account.name)?;
+    eds::store_password(&uid, &eds::display_name(account), &secrets.bridge_password)?;
+    let path = eds::install(&directory, &uid, &eds::source_file(&config, account))?;
+    println!(
+        "Registered {} with Evolution Data Server ({}).\n\
+         Its calendars are served while the bridge runs. If they do not appear,\n\
+         restart the registry: systemctl --user restart evolution-source-registry",
+        account.email,
+        path.display()
     );
     Ok(())
 }

@@ -194,7 +194,7 @@ async fn photo_endpoint_requires_bridge_credentials() {
     let (_temporary, runtime) = runtime();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let task = tokio::spawn(graphmail_bridge::photos::serve(listener, runtime));
+    let task = tokio::spawn(graphmail_bridge::http::serve(listener, runtime));
 
     async fn get(address: std::net::SocketAddr, request: &str) -> String {
         let mut stream = TcpStream::connect(address).await.unwrap();
@@ -208,17 +208,21 @@ async fn photo_endpoint_requires_bridge_credentials() {
 
     let anonymous = get(
         address,
-        "GET /photo?address=bob%40example.com HTTP/1.1\r\nHost: x\r\n\r\n",
+        "GET /photo?address=bob%40example.com HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
     )
     .await;
     assert!(anonymous.starts_with("HTTP/1.1 401 "), "{anonymous}");
-    assert!(anonymous.contains("WWW-Authenticate: Basic"));
+    assert!(
+        anonymous
+            .to_ascii_lowercase()
+            .contains("www-authenticate: basic")
+    );
 
     let wrong = base64::engine::general_purpose::STANDARD.encode("work:nope");
     let denied = get(
         address,
         &format!(
-            "GET /photo?address=bob%40example.com HTTP/1.1\r\nAuthorization: Basic {wrong}\r\n\r\n"
+            "GET /photo?address=bob%40example.com HTTP/1.1\r\nAuthorization: Basic {wrong}\r\nConnection: close\r\n\r\n"
         ),
     )
     .await;
@@ -227,14 +231,18 @@ async fn photo_endpoint_requires_bridge_credentials() {
     let right = base64::engine::general_purpose::STANDARD.encode("me@example.com:local-secret");
     let missing = get(
         address,
-        &format!("GET /photo HTTP/1.1\r\nAuthorization: Basic {right}\r\n\r\n"),
+        &format!(
+            "GET /photo HTTP/1.1\r\nAuthorization: Basic {right}\r\nConnection: close\r\n\r\n"
+        ),
     )
     .await;
     assert!(missing.starts_with("HTTP/1.1 400 "), "{missing}");
 
     let elsewhere = get(
         address,
-        &format!("GET /other HTTP/1.1\r\nAuthorization: Basic {right}\r\n\r\n"),
+        &format!(
+            "GET /other HTTP/1.1\r\nAuthorization: Basic {right}\r\nConnection: close\r\n\r\n"
+        ),
     )
     .await;
     assert!(elsewhere.starts_with("HTTP/1.1 404 "), "{elsewhere}");

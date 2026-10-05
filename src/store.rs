@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::graph::{FollowupFlag, MailFolder, MessageSummary, Recipient};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 pub struct Store {
     connection: Mutex<Connection>,
@@ -78,7 +78,7 @@ impl Store {
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.connection.lock().expect("store mutex poisoned")
     }
 
@@ -814,12 +814,54 @@ fn migrate(connection: &mut Connection) -> Result<()> {
              last_access INTEGER NOT NULL,
              PRIMARY KEY (account, message_id)
          );
-         CREATE INDEX IF NOT EXISTS body_cache_lru ON body_cache(last_access);",
+         CREATE INDEX IF NOT EXISTS body_cache_lru ON body_cache(last_access);
+         CREATE TABLE IF NOT EXISTS calendars (
+             account TEXT NOT NULL,
+             calendar_id TEXT NOT NULL,
+             slug TEXT NOT NULL,
+             name TEXT NOT NULL,
+             color TEXT,
+             can_edit INTEGER NOT NULL DEFAULT 0,
+             is_default INTEGER NOT NULL DEFAULT 0,
+             modseq INTEGER NOT NULL DEFAULT 0,
+             last_sync INTEGER,
+             last_error TEXT,
+             PRIMARY KEY (account, calendar_id),
+             UNIQUE (account, slug)
+         );
+         CREATE TABLE IF NOT EXISTS calendar_objects (
+             account TEXT NOT NULL,
+             calendar_id TEXT NOT NULL,
+             href TEXT NOT NULL,
+             event_id TEXT NOT NULL,
+             uid TEXT NOT NULL,
+             change_key TEXT,
+             graph_json TEXT NOT NULL,
+             exceptions_json TEXT NOT NULL,
+             ics TEXT NOT NULL,
+             etag TEXT NOT NULL,
+             render_version INTEGER NOT NULL,
+             modseq INTEGER NOT NULL,
+             PRIMARY KEY (account, calendar_id, href),
+             UNIQUE (account, event_id),
+             FOREIGN KEY (account, calendar_id)
+               REFERENCES calendars(account, calendar_id) ON DELETE CASCADE
+         );
+         CREATE TABLE IF NOT EXISTS calendar_tombstones (
+             account TEXT NOT NULL,
+             calendar_id TEXT NOT NULL,
+             href TEXT NOT NULL,
+             modseq INTEGER NOT NULL,
+             PRIMARY KEY (account, calendar_id, href),
+             FOREIGN KEY (account, calendar_id)
+               REFERENCES calendars(account, calendar_id) ON DELETE CASCADE
+         );",
     )?;
     if version == 1 {
         // v2: Outlook pin state; NULL until the first pin refresh reads it.
         transaction.execute_batch("ALTER TABLE messages ADD COLUMN pinned INTEGER;")?;
     }
+    // v3 only adds the calendar tables, which the batch above creates.
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
