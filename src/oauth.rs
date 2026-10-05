@@ -1,0 +1,459 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use chrono::Utc;
+use oauth2::basic::BasicClient;
+use oauth2::{
+    AuthUrl, ClientId, DeviceAuthorizationUrl, RefreshToken, Scope,
+    StandardDeviceAuthorizationResponse, TokenResponse, TokenUrl,
+};
+use serde::Deserialize;
+use tokio::sync::Mutex;
+
+use crate::config::{AccountConfig, AuthProfile, MICROSOFT_GRAPH_RESOURCE};
+use crate::secrets::{AccountSecrets, SecretStore};
+
+#[derive(Clone)]
+pub struct TokenManager {
+    account: AccountConfig,
+    store: SecretStore,
+    secrets: Arc<Mutex<AccountSecrets>>,
+    http: reqwest::Client,
+}
+
+impl TokenManager {
+    pub fn from_store(account: &AccountConfig, store: &SecretStore) -> Result<Self> {
+        let secrets = store.load(&account.name)?;
+        Ok(Self::new(account.clone(), store.clone(), secrets))
+    }
+
+    /// Persist the current secrets without blocking the async runtime; the
+    /// keyring backend performs synchronous D-Bus I/O.
+    async fn persist(&self, secrets: &AccountSecrets) -> Result<()> {
+        let store = self.store.clone();
+        let name = self.account.name.clone();
+        let secrets = secrets.clone();
+        tokio::task::spawn_blocking(move || store.save(&name, &secrets))
+            .await
+            .context("secret store task failed")?
+    }
+
+    pub fn new(account: AccountConfig, store: SecretStore, secrets: AccountSecrets) -> Self {
+        Self {
+            account,
+            store,
+            secrets: Arc::new(Mutex::new(secrets)),
+            http: secure_http_client(),
+        }
+    }
+
+    pub async fn access_token(&self) -> Result<String> {
+        let mut secrets = self.secrets.lock().await;
+        let usable = secrets
+            .access_token_expires_at
+            .is_some_and(|expires| expires > Utc::now().timestamp() + 90);
+        if usable && let Some(token) = &secrets.access_token {
+            return Ok(token.clone());
+        }
+
+        match self.account.auth_profile {
+            AuthProfile::MicrosoftOffice => {
+                let response =
+                    office_refresh_token(&self.account, &self.http, secrets.refresh_token.as_str())
+                        .await
+                        .context(
+                            "Microsoft rejected the refresh token; run `graphmail-bridge login`",
+                        )?;
+                secrets.access_token = Some(response.access_token);
+                secrets.access_token_expires_at =
+                    Some(Utc::now().timestamp() + response.expires_in.unwrap_or(3600) as i64);
+                if let Some(refresh_token) = response.refresh_token {
+                    secrets.refresh_token = refresh_token;
+                }
+            }
+            AuthProfile::CustomEntra => {
+                let client = oauth_client(&self.account)?;
+                let refresh_token = RefreshToken::new(secrets.refresh_token.clone());
+                let response = client
+                    .exchange_refresh_token(&refresh_token)
+                    .request_async(&self.http)
+                    .await
+                    .context(
+                        "Microsoft rejected the refresh token; run `graphmail-bridge login`",
+                    )?;
+                secrets.access_token = Some(response.access_token().secret().to_owned());
+                secrets.access_token_expires_at = Some(
+                    Utc::now().timestamp()
+                        + response
+                            .expires_in()
+                            .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(3600))
+                            .unwrap_or(3600),
+                );
+                if let Some(refresh) = response.refresh_token() {
+                    secrets.refresh_token = refresh.secret().to_owned();
+                }
+            }
+        }
+        self.persist(&secrets).await?;
+        Ok(secrets.access_token.clone().expect("access token just set"))
+    }
+
+    /// Force a refresh-token exchange even when the cached access token is
+    /// still usable. This is intended for explicit diagnostics.
+    pub async fn refresh_access_token(&self) -> Result<String> {
+        {
+            let mut secrets = self.secrets.lock().await;
+            secrets.access_token_expires_at = None;
+        }
+        self.access_token().await
+    }
+
+    pub async fn bridge_password_matches(&self, candidate: &str) -> bool {
+        use subtle::ConstantTimeEq;
+        let secrets = self.secrets.lock().await;
+        secrets
+            .bridge_password
+            .as_bytes()
+            .ct_eq(candidate.as_bytes())
+            .into()
+    }
+}
+
+pub async fn device_login(
+    account: &AccountConfig,
+    store: &SecretStore,
+    bridge_password: String,
+) -> Result<AccountSecrets> {
+    let secrets = match account.auth_profile {
+        AuthProfile::MicrosoftOffice => office_device_login(account, bridge_password).await?,
+        AuthProfile::CustomEntra => custom_device_login(account, bridge_password).await?,
+    };
+    store.save(&account.name, &secrets)?;
+    Ok(secrets)
+}
+
+async fn custom_device_login(
+    account: &AccountConfig,
+    bridge_password: String,
+) -> Result<AccountSecrets> {
+    let client = oauth_client(account)?;
+    let mut request = client.exchange_device_code();
+    for scope in &account.scopes {
+        request = request.add_scope(Scope::new(scope.clone()));
+    }
+    let details: StandardDeviceAuthorizationResponse = request
+        .request_async(&secure_http_client())
+        .await
+        .context("could not start Microsoft device authorization")?;
+
+    println!(
+        "\nOpen {} and enter code {}.\n",
+        details.verification_uri(),
+        details.user_code().secret()
+    );
+    if let Some(uri) = details.verification_uri_complete() {
+        let _ = open::that(uri.secret());
+    }
+
+    let response = client
+        .exchange_device_access_token(&details)
+        .request_async(&secure_http_client(), tokio::time::sleep, None)
+        .await
+        .context("Microsoft device authorization failed")?;
+    let Some(refresh_token) = response.refresh_token() else {
+        bail!("Microsoft did not return a refresh token; verify offline_access is allowed");
+    };
+    Ok(AccountSecrets {
+        bridge_password,
+        refresh_token: refresh_token.secret().to_owned(),
+        access_token: Some(response.access_token().secret().to_owned()),
+        access_token_expires_at: Some(
+            Utc::now().timestamp()
+                + response
+                    .expires_in()
+                    .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(3600))
+                    .unwrap_or(3600),
+        ),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct OfficeDeviceAuthorization {
+    device_code: String,
+    user_code: String,
+    #[serde(alias = "verification_uri")]
+    verification_url: String,
+    #[serde(deserialize_with = "deserialize_u64")]
+    expires_in: u64,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    interval: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OfficeTokenResponse {
+    access_token: String,
+    refresh_token: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    expires_in: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OfficeOAuthError {
+    error: String,
+    error_description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum NumberOrString {
+    Number(u64),
+    String(String),
+}
+
+impl NumberOrString {
+    fn into_u64<E: serde::de::Error>(self) -> std::result::Result<u64, E> {
+        match self {
+            Self::Number(value) => Ok(value),
+            Self::String(value) => value.parse().map_err(E::custom),
+        }
+    }
+}
+
+fn deserialize_u64<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    NumberOrString::deserialize(deserializer)?.into_u64()
+}
+
+fn deserialize_optional_u64<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<NumberOrString>::deserialize(deserializer)?
+        .map(NumberOrString::into_u64)
+        .transpose()
+}
+
+async fn office_device_login(
+    account: &AccountConfig,
+    bridge_password: String,
+) -> Result<AccountSecrets> {
+    let http = secure_http_client();
+    let authority = oauth_authority(account);
+    let response = http
+        .post(format!("{authority}/devicecode"))
+        .form(&[
+            ("client_id", account.client_id.as_str()),
+            ("resource", MICROSOFT_GRAPH_RESOURCE),
+        ])
+        .send()
+        .await
+        .context("could not start Microsoft Office device authorization")?;
+    let response = response
+        .error_for_status()
+        .context("Microsoft rejected the Office device authorization request")?;
+    let details: OfficeDeviceAuthorization = response
+        .json()
+        .await
+        .context("could not parse Microsoft Office device authorization")?;
+
+    println!(
+        "\nOpen {} and enter code {}.\n",
+        details.verification_url, details.user_code
+    );
+    let _ = open::that(&details.verification_url);
+
+    let deadline = Instant::now() + Duration::from_secs(details.expires_in);
+    let mut interval = Duration::from_secs(details.interval.unwrap_or(5).max(1));
+    let token_url = format!("{authority}/token");
+    loop {
+        if Instant::now() >= deadline {
+            bail!("Microsoft Office device authorization expired; run login again");
+        }
+        tokio::time::sleep(interval).await;
+        let response = http
+            .post(&token_url)
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("client_id", account.client_id.as_str()),
+                ("code", details.device_code.as_str()),
+                ("resource", MICROSOFT_GRAPH_RESOURCE),
+            ])
+            .send()
+            .await
+            .context("Microsoft Office device-token request failed")?;
+        if response.status().is_success() {
+            let token: OfficeTokenResponse = response
+                .json()
+                .await
+                .context("could not parse Microsoft Office token response")?;
+            let Some(refresh_token) = token.refresh_token else {
+                bail!("Microsoft did not return a refresh token");
+            };
+            return Ok(AccountSecrets {
+                bridge_password,
+                refresh_token,
+                access_token: Some(token.access_token),
+                access_token_expires_at: Some(
+                    Utc::now().timestamp() + token.expires_in.unwrap_or(3600) as i64,
+                ),
+            });
+        }
+
+        let error: OfficeOAuthError = response
+            .json()
+            .await
+            .context("could not parse Microsoft Office authorization error")?;
+        match error.error.as_str() {
+            "authorization_pending" => {}
+            "slow_down" => interval += Duration::from_secs(5),
+            "authorization_declined" | "access_denied" => {
+                bail!("Microsoft Office authorization was declined")
+            }
+            "expired_token" | "code_expired" => {
+                bail!("Microsoft Office device authorization expired; run login again")
+            }
+            _ => bail!(
+                "Microsoft Office authorization failed: {}: {}",
+                error.error,
+                error.error_description.as_deref().unwrap_or("no details")
+            ),
+        }
+    }
+}
+
+async fn office_refresh_token(
+    account: &AccountConfig,
+    http: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<OfficeTokenResponse> {
+    let response = http
+        .post(format!("{}/token", oauth_authority(account)))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", account.client_id.as_str()),
+            ("resource", MICROSOFT_GRAPH_RESOURCE),
+        ])
+        .send()
+        .await
+        .context("Microsoft Office token refresh request failed")?;
+    if response.status().is_success() {
+        return response
+            .json()
+            .await
+            .context("could not parse Microsoft Office refresh response");
+    }
+    let error: OfficeOAuthError = response
+        .json()
+        .await
+        .context("could not parse Microsoft Office refresh error")?;
+    bail!(
+        "Microsoft Office token refresh failed: {}: {}",
+        error.error,
+        error.error_description.as_deref().unwrap_or("no details")
+    )
+}
+
+fn oauth_client(
+    account: &AccountConfig,
+) -> Result<
+    BasicClient<
+        oauth2::EndpointSet,
+        oauth2::EndpointSet,
+        oauth2::EndpointNotSet,
+        oauth2::EndpointNotSet,
+        oauth2::EndpointSet,
+    >,
+> {
+    let authority = oauth_authority(account);
+    Ok(BasicClient::new(ClientId::new(account.client_id.clone()))
+        .set_auth_uri(AuthUrl::new(format!("{authority}/authorize"))?)
+        .set_token_uri(TokenUrl::new(format!("{authority}/token"))?)
+        .set_device_authorization_url(DeviceAuthorizationUrl::new(format!(
+            "{authority}/devicecode"
+        ))?))
+}
+
+fn oauth_authority(account: &AccountConfig) -> String {
+    let version = match account.auth_profile {
+        AuthProfile::MicrosoftOffice => "oauth2",
+        AuthProfile::CustomEntra => "oauth2/v2.0",
+    };
+    format!(
+        "https://login.microsoftonline.com/{}/{version}",
+        account.tenant
+    )
+}
+
+fn secure_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(60))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("TLS HTTP client construction should succeed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{MICROSOFT_OFFICE_CLIENT_ID, default_scopes};
+
+    fn account(auth_profile: AuthProfile) -> AccountConfig {
+        AccountConfig {
+            name: "work".into(),
+            email: "me@example.com".into(),
+            auth_profile,
+            tenant: "common".into(),
+            client_id: MICROSOFT_OFFICE_CLIENT_ID.into(),
+            scopes: default_scopes(),
+        }
+    }
+
+    #[test]
+    fn office_profile_uses_v1_authority() {
+        assert_eq!(
+            oauth_authority(&account(AuthProfile::MicrosoftOffice)),
+            "https://login.microsoftonline.com/common/oauth2"
+        );
+    }
+
+    #[test]
+    fn custom_profile_uses_v2_authority() {
+        assert_eq!(
+            oauth_authority(&account(AuthProfile::CustomEntra)),
+            "https://login.microsoftonline.com/common/oauth2/v2.0"
+        );
+    }
+
+    #[test]
+    fn parses_microsoft_v1_quoted_lifetimes() {
+        let device: OfficeDeviceAuthorization = serde_json::from_str(
+            r#"{
+                "device_code": "device",
+                "user_code": "ABCD-EFGH",
+                "verification_url": "https://login.microsoft.com/device",
+                "expires_in": "900",
+                "interval": "5"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(device.expires_in, 900);
+        assert_eq!(device.interval, Some(5));
+
+        let token: OfficeTokenResponse = serde_json::from_str(
+            r#"{
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_in": "3599"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(token.expires_in, Some(3599));
+    }
+}
