@@ -220,6 +220,10 @@ pub struct AccountConfig {
     pub client_id: String,
     #[serde(default = "default_scopes")]
     pub scopes: Vec<String>,
+    /// For the `goa` profile: the GNOME Online Accounts account whose
+    /// Microsoft 365 token this account uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goa_account: Option<String>,
 }
 
 /// Selects the Microsoft OAuth protocol and application identity.
@@ -233,6 +237,9 @@ pub enum AuthProfile {
     MicrosoftOffice,
     #[default]
     CustomEntra,
+    /// The token of a GNOME Online Accounts Microsoft 365 account, for a
+    /// tenant that allows GOA's own app. No login of the bridge's own.
+    Goa,
 }
 
 fn default_tenant() -> String {
@@ -333,10 +340,21 @@ impl Config {
             if !account.email.contains('@') {
                 bail!("account {} has an invalid email address", account.name);
             }
-            if account.client_id.trim().is_empty() {
+            if account.auth_profile == AuthProfile::Goa {
+                if account
+                    .goa_account
+                    .as_deref()
+                    .is_none_or(|id| id.trim().is_empty())
+                {
+                    bail!(
+                        "account {} uses the goa profile without a GOA account",
+                        account.name
+                    );
+                }
+            } else if account.client_id.trim().is_empty() {
                 bail!("account {} has no Entra client ID", account.name);
             }
-            if account.tenant.trim().is_empty() {
+            if account.auth_profile != AuthProfile::Goa && account.tenant.trim().is_empty() {
                 bail!("account {} has no Entra tenant", account.name);
             }
             match account.auth_profile {
@@ -392,6 +410,7 @@ mod tests {
             tenant: "organizations".into(),
             client_id: "client-id".into(),
             scopes: default_scopes(),
+            goa_account: None,
         }
     }
 

@@ -230,6 +230,7 @@ mod tests {
             tenant: "organizations".into(),
             client_id: "client".into(),
             scopes: default_scopes(),
+            goa_account: None,
         }
     }
 

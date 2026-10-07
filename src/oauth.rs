@@ -60,6 +60,14 @@ impl TokenManager {
         }
 
         match self.account.auth_profile {
+            AuthProfile::Goa => {
+                let account = self.account.goa_account.as_deref().unwrap_or_default();
+                let (token, expires_in) = goa_access_token(account).await?;
+                secrets.access_token = Some(token.clone());
+                secrets.access_token_expires_at = Some(Utc::now().timestamp() + expires_in);
+                // Nothing worth persisting: GOA holds the refresh token.
+                return Ok(token);
+            }
             AuthProfile::MicrosoftOffice => {
                 let response =
                     office_refresh_token(&self.account, &self.http, secrets.refresh_token.as_str())
@@ -122,22 +130,102 @@ impl TokenManager {
     }
 }
 
+/// What a device-code login asks the user to do: open the page and type
+/// the code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceCode {
+    pub verification_url: String,
+    pub user_code: String,
+}
+
+/// Device-code login for a terminal: the code is printed, and the page
+/// opened in the browser.
 pub async fn device_login(
     account: &AccountConfig,
     store: &SecretStore,
     bridge_password: String,
 ) -> Result<AccountSecrets> {
+    device_login_with(account, store, bridge_password, &|code: &DeviceCode| {
+        println!(
+            "\nOpen {} and enter code {}.\n",
+            code.verification_url, code.user_code
+        );
+        let _ = open::that(&code.verification_url);
+    })
+    .await
+}
+
+/// Device-code login that hands the code to `on_code`, for a program that
+/// shows it its own way. A GOA account has no login of its own: its tokens
+/// come from GNOME Online Accounts.
+pub async fn device_login_with(
+    account: &AccountConfig,
+    store: &SecretStore,
+    bridge_password: String,
+    on_code: &(dyn Fn(&DeviceCode) + Send + Sync),
+) -> Result<AccountSecrets> {
     let secrets = match account.auth_profile {
-        AuthProfile::MicrosoftOffice => office_device_login(account, bridge_password).await?,
-        AuthProfile::CustomEntra => custom_device_login(account, bridge_password).await?,
+        AuthProfile::MicrosoftOffice => {
+            office_device_login(account, bridge_password, on_code).await?
+        }
+        AuthProfile::CustomEntra => custom_device_login(account, bridge_password, on_code).await?,
+        AuthProfile::Goa => AccountSecrets {
+            bridge_password,
+            refresh_token: String::new(),
+            access_token: None,
+            access_token_expires_at: None,
+        },
     };
     store.save(&account.name, &secrets)?;
     Ok(secrets)
 }
 
+/// A GOA account's current access token and its lifetime in seconds,
+/// through GOA's D-Bus API (GOA refreshes it itself).
+async fn goa_access_token(goa_account: &str) -> Result<(String, i64)> {
+    if !goa_account
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        bail!("invalid GNOME Online Accounts id {goa_account:?}");
+    }
+    let output = tokio::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.gnome.OnlineAccounts",
+            "--object-path",
+            &format!("/org/gnome/OnlineAccounts/Accounts/{goa_account}"),
+            "--method",
+            "org.gnome.OnlineAccounts.OAuth2Based.GetAccessToken",
+        ])
+        .output()
+        .await
+        .context("could not run gdbus to ask GNOME Online Accounts for a token")?;
+    if !output.status.success() {
+        bail!(
+            "GNOME Online Accounts gave no token: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    parse_goa_token(&String::from_utf8_lossy(&output.stdout))
+        .context("could not read the token GNOME Online Accounts returned")
+}
+
+/// `('eyJ0…', 3599)`, the shape gdbus prints the (si) reply in.
+fn parse_goa_token(reply: &str) -> Option<(String, i64)> {
+    let reply = reply.trim().strip_prefix("(")?.strip_suffix(")")?;
+    let (token, expires) = reply.rsplit_once(',')?;
+    let token = token.trim().strip_prefix('\'')?.strip_suffix('\'')?;
+    let expires = expires.trim().parse().ok()?;
+    (!token.is_empty()).then(|| (token.to_owned(), expires))
+}
+
 async fn custom_device_login(
     account: &AccountConfig,
     bridge_password: String,
+    on_code: &(dyn Fn(&DeviceCode) + Send + Sync),
 ) -> Result<AccountSecrets> {
     let client = oauth_client(account)?;
     let mut request = client.exchange_device_code();
@@ -149,14 +237,13 @@ async fn custom_device_login(
         .await
         .context("could not start Microsoft device authorization")?;
 
-    println!(
-        "\nOpen {} and enter code {}.\n",
-        details.verification_uri(),
-        details.user_code().secret()
-    );
-    if let Some(uri) = details.verification_uri_complete() {
-        let _ = open::that(uri.secret());
-    }
+    on_code(&DeviceCode {
+        verification_url: details
+            .verification_uri_complete()
+            .map(|uri| uri.secret().to_owned())
+            .unwrap_or_else(|| details.verification_uri().to_string()),
+        user_code: details.user_code().secret().to_owned(),
+    });
 
     let response = client
         .exchange_device_access_token(&details)
@@ -241,6 +328,7 @@ where
 async fn office_device_login(
     account: &AccountConfig,
     bridge_password: String,
+    on_code: &(dyn Fn(&DeviceCode) + Send + Sync),
 ) -> Result<AccountSecrets> {
     let http = secure_http_client();
     let authority = oauth_authority(account);
@@ -261,11 +349,10 @@ async fn office_device_login(
         .await
         .context("could not parse Microsoft Office device authorization")?;
 
-    println!(
-        "\nOpen {} and enter code {}.\n",
-        details.verification_url, details.user_code
-    );
-    let _ = open::that(&details.verification_url);
+    on_code(&DeviceCode {
+        verification_url: details.verification_url.clone(),
+        user_code: details.user_code.clone(),
+    });
 
     let deadline = Instant::now() + Duration::from_secs(details.expires_in);
     let mut interval = Duration::from_secs(details.interval.unwrap_or(5).max(1));
@@ -382,7 +469,7 @@ fn oauth_client(
 fn oauth_authority(account: &AccountConfig) -> String {
     let version = match account.auth_profile {
         AuthProfile::MicrosoftOffice => "oauth2",
-        AuthProfile::CustomEntra => "oauth2/v2.0",
+        AuthProfile::CustomEntra | AuthProfile::Goa => "oauth2/v2.0",
     };
     format!(
         "https://login.microsoftonline.com/{}/{version}",
@@ -425,6 +512,16 @@ pub fn token_scopes(access_token: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_goa_token_reply() {
+        assert_eq!(
+            parse_goa_token("('eyJ0.abc', 3599)\n"),
+            Some(("eyJ0.abc".to_owned(), 3599))
+        );
+        assert_eq!(parse_goa_token("('', 10)"), None);
+        assert_eq!(parse_goa_token("Error: no such account"), None);
+    }
     use crate::config::{MICROSOFT_OFFICE_CLIENT_ID, default_scopes};
 
     fn account(auth_profile: AuthProfile) -> AccountConfig {
@@ -435,6 +532,7 @@ mod tests {
             tenant: "common".into(),
             client_id: MICROSOFT_OFFICE_CLIENT_ID.into(),
             scopes: default_scopes(),
+            goa_account: None,
         }
     }
 

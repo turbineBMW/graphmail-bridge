@@ -6,19 +6,16 @@ use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
 use dialoguer::{Input, Select};
-use graphmail_bridge::config::{
-    AccountConfig, AppPaths, AuthProfile, Config, MICROSOFT_OFFICE_CLIENT_ID, SecretBackend,
-    default_scopes,
-};
+use graphmail_bridge::config::{AccountConfig, AppPaths, AuthProfile, Config};
 use graphmail_bridge::eds;
 use graphmail_bridge::graph::GraphClient;
-use graphmail_bridge::oauth::{TokenManager, device_login, token_scopes};
+use graphmail_bridge::oauth::{DeviceCode, TokenManager, device_login, token_scopes};
 use graphmail_bridge::secrets::SecretStore;
 use graphmail_bridge::service::{Runtime, install_user_unit};
+use graphmail_bridge::setup::NewAccount;
 use graphmail_bridge::store::Store;
 use tracing_subscriber::EnvFilter;
 
@@ -171,72 +168,40 @@ async fn setup(
              Mail.ReadWrite, Mail.Send, and User.Read permissions with public client\n\
              flows enabled. No client secret is used.\n"
         ),
+        AuthProfile::Goa => bail!(
+            "a goa account takes its tokens from GNOME Online Accounts; add it from a program that \
+             can pick the GOA account, such as Rustle"
+        ),
     }
     let name = prompt(name, "Short account name", Some("work"))?;
     let email = prompt(email, "Microsoft 365 email address", None)?;
-    let (tenant, client_id, scopes) = match auth_profile {
-        AuthProfile::MicrosoftOffice => {
-            if let Some(supplied) = client_id.as_deref()
-                && supplied.trim() != MICROSOFT_OFFICE_CLIENT_ID
-            {
-                bail!(
-                    "--client-id cannot override the fixed Microsoft Office identity; use --auth-profile custom-entra"
-                );
-            }
-            (
-                tenant.unwrap_or_else(|| "common".to_owned()),
-                MICROSOFT_OFFICE_CLIENT_ID.to_owned(),
-                Vec::new(),
-            )
-        }
-        AuthProfile::CustomEntra => (
-            tenant.unwrap_or_else(|| "organizations".to_owned()),
-            prompt(client_id, "Entra application (client) ID", None)?,
-            default_scopes(),
-        ),
+    // A custom app needs its client ID; the library checks the rest.
+    let client_id = match auth_profile {
+        AuthProfile::CustomEntra => Some(prompt(client_id, "Entra application (client) ID", None)?),
+        _ => client_id,
     };
-    let account = AccountConfig {
-        name: name.trim().to_owned(),
-        email: email.trim().to_owned(),
-        auth_profile,
-        tenant: tenant.trim().to_owned(),
-        client_id: client_id.trim().to_owned(),
-        scopes,
-    };
-
-    let mut config = if paths.config_file.exists() {
-        let existing = Config::load(paths)?;
-        if file_secrets
-            && existing.secrets.backend != SecretBackend::File
-            && !existing.accounts.is_empty()
-        {
-            bail!(
-                "refusing to switch an existing multi-account configuration to file secrets; migrate its credentials first"
+    let (account, address) = graphmail_bridge::setup::add_account(
+        paths,
+        NewAccount {
+            name,
+            email,
+            auth_profile,
+            tenant,
+            client_id,
+            goa_account: None,
+            file_secrets,
+        },
+        &|code: &DeviceCode| {
+            println!(
+                "\nOpen {} and enter code {}.\n",
+                code.verification_url, code.user_code
             );
-        }
-        existing
-    } else {
-        Config::default()
-    };
-    if file_secrets {
-        config.secrets.backend = SecretBackend::File;
-    }
-    config.upsert_account(account.clone());
-    config.validate()?;
-
-    let store = SecretStore::new(config.secrets.backend, paths);
-    let password = generate_bridge_password();
-    let secrets = device_login(&account, &store, password).await?;
-    let token_manager = Arc::new(TokenManager::new(account.clone(), store, secrets));
-    let profile = GraphClient::new(token_manager).profile().await?;
-    config.save(paths)?;
-
+            let _ = open::that(&code.verification_url);
+        },
+    )
+    .await?;
     println!(
-        "\nAuthorized as {}. Configuration saved to {}.",
-        profile
-            .mail
-            .as_deref()
-            .unwrap_or(&profile.user_principal_name),
+        "\nAuthorized as {address}. Configuration saved to {}.",
         paths.config_file.display()
     );
     print_client_config(paths, Some(&account.name))?;
@@ -254,7 +219,7 @@ async fn login(paths: &AppPaths, account_name: Option<&str>) -> Result<()> {
             eprintln!(
                 "warning: existing credentials could not be read ({error:#}); a new bridge password will be generated"
             );
-            (generate_bridge_password(), true)
+            (graphmail_bridge::setup::generate_bridge_password(), true)
         }
     };
     let secrets = device_login(account, &store, password).await?;
@@ -476,44 +441,18 @@ fn print_client_config(paths: &AppPaths, account_name: Option<&str>) -> Result<(
 async fn eds_setup(paths: &AppPaths, account_name: Option<&str>, remove: bool) -> Result<()> {
     let config = Config::load(paths)?;
     let account = resolve_account(&config, account_name)?;
-    let uid = eds::source_uid(account);
-    let directory = eds::sources_dir()?;
     if remove {
-        for (source_uid, _) in eds::sources(&config, account, "") {
-            let path = directory.join(format!("{source_uid}.source"));
-            if path.exists() {
-                fs::remove_file(&path)
-                    .with_context(|| format!("could not remove {}", path.display()))?;
-            }
-        }
-        eds::clear_password(&uid)?;
+        graphmail_bridge::setup::unregister_from_eds(paths, &account.name)?;
         println!("Removed {} from Evolution Data Server.", account.email);
         return Ok(());
     }
-    let store = SecretStore::new(config.secrets.backend, paths);
-    let secrets = store.load(&account.name)?;
-    // The From name comes from the directory; the short account name is a
-    // fallback when Graph cannot be reached.
-    let manager = Arc::new(TokenManager::from_store(account, &store)?);
-    let name = match GraphClient::new(manager).profile().await {
-        Ok(profile) => profile.display_name.unwrap_or_else(|| account.name.clone()),
-        Err(error) => {
-            eprintln!("note: could not read your name from Microsoft Graph ({error:#})");
-            account.name.clone()
-        }
-    };
-    eds::store_password(&uid, &eds::display_name(account), &secrets.bridge_password)?;
-    // Children first, so the collection never points at missing sources.
-    let sources = eds::sources(&config, account, &name);
-    for (source_uid, contents) in sources.iter().rev() {
-        eds::install(&directory, source_uid, contents)?;
-    }
+    graphmail_bridge::setup::register_with_eds(paths, &account.name).await?;
     println!(
         "Registered {} with Evolution Data Server (calendars and mail, in {}).\n\
          Calendars are served while the bridge runs. If the account does not\n\
          appear, restart the registry: systemctl --user restart evolution-source-registry",
         account.email,
-        directory.display()
+        eds::sources_dir()?.display()
     );
     Ok(())
 }
@@ -604,10 +543,4 @@ fn prompt(value: Option<String>, label: &str, default: Option<&str>) -> Result<S
         input = input.default(default.to_owned());
     }
     input.interact_text().context("setup prompt failed")
-}
-
-fn generate_bridge_password() -> String {
-    let mut bytes = [0_u8; 24];
-    rand::fill(&mut bytes);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
