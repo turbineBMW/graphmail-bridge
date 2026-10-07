@@ -13,6 +13,7 @@ pub mod photos;
 pub mod search;
 pub mod secrets;
 pub mod service;
+pub mod setup;
 pub mod smtp;
 pub mod store;
 pub mod sync;

@@ -21,6 +21,7 @@ fn runtime() -> (tempfile::TempDir, Arc<Runtime>) {
         tenant: "organizations".into(),
         client_id: "test-client".into(),
         scopes: default_scopes(),
+        goa_account: None,
     };
     let mut config = Config::default();
     config.secrets.backend = SecretBackend::File;
