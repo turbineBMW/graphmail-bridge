@@ -418,6 +418,18 @@ async fn dispatch(
                 Some(flagged),
                 None,
             )?;
+            // Appended to the selected mailbox: the client hears of it now
+            // (EXISTS), and a SEARCH right after finds it, as RFC 3501 asks.
+            // The message is already created, so a failed refresh mustn't
+            // fail the APPEND and make the client upload it again.
+            if session
+                .selected
+                .as_ref()
+                .is_some_and(|selected| selected.id == folder.id)
+                && let Err(error) = refresh_selected(session, runtime, writer).await
+            {
+                tracing::warn!(%error, "refresh after APPEND failed");
+            }
             tagged_ok(writer, tag, "APPEND completed").await?;
         }
         ImapCommand::Create { mailbox } => {
