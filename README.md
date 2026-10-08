@@ -278,6 +278,23 @@ To remove only the service while preserving accounts and tokens:
 graphmail-bridge uninstall-service
 ```
 
+To uninstall what `./install.sh` put in place, the service and the binary in
+`~/.local/bin`, run this from the checkout:
+
+```console
+./uninstall.sh
+```
+
+Accounts, tokens and the mail cache stay, so a reinstall picks up where it left
+off. Rustle's built-in bridge uses the same setup and takes over the next time
+Rustle starts. To remove everything, including the Evolution Data Server
+registration, the keyring tokens, `~/.config/graphmail-bridge` and
+`~/.local/share/graphmail-bridge`, run:
+
+```console
+./uninstall.sh --purge
+```
+
 Configuration is in `~/.config/graphmail-bridge/config.toml`; cache data is in
 `~/.local/share/graphmail-bridge/`. Run `graphmail-bridge login` when an
 administrator revokes consent or a refresh token expires.
