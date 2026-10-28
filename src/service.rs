@@ -4,17 +4,18 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use crate::config::{AccountConfig, AppPaths, Config};
 use crate::graph::GraphClient;
 use crate::oauth::TokenManager;
 use crate::secrets::SecretStore;
 use crate::store::Store;
-use crate::sync::FolderChange;
+use crate::sync::{FolderChange, MIN_INBOX_POLL, Pace};
 
 pub struct AccountRuntime {
     pub config: AccountConfig,
@@ -30,6 +31,9 @@ pub struct Runtime {
     pub store: Arc<Store>,
     /// Folder-change notifications from the sync tasks to idling sessions.
     pub changes: broadcast::Sender<FolderChange>,
+    /// How the sync tasks poll the hot folders; see `set_inbox_poll` and
+    /// `sync_now`.
+    pub pace: watch::Sender<Pace>,
     accounts: HashMap<String, Arc<AccountRuntime>>,
     /// Each configured account exactly once (the map above has two keys per account).
     unique_accounts: Vec<Arc<AccountRuntime>>,
@@ -59,10 +63,12 @@ impl Runtime {
             bail!("no accounts configured; run `graphmail-bridge setup`");
         }
         let (changes, _) = broadcast::channel(256);
+        let (pace, _) = watch::channel(Pace::from_config(&config.sync));
         Ok(Arc::new(Self {
             config: Arc::new(config),
             store: Arc::new(Store::open(&paths.cache_db)?),
             changes,
+            pace,
             accounts,
             unique_accounts,
         }))
@@ -70,6 +76,31 @@ impl Runtime {
 
     pub fn accounts(&self) -> &[Arc<AccountRuntime>] {
         &self.unique_accounts
+    }
+
+    /// Poll Inbox, Sent, and Drafts every `interval` from now on, instead of
+    /// the configured `sync.inbox_poll_secs`. The sync tasks pick it up at
+    /// once, so shortening it with a poll overdue under the new pace polls
+    /// straight away. Never faster than `MIN_INBOX_POLL`.
+    pub fn set_inbox_poll(&self, interval: Duration) {
+        let interval = interval.max(MIN_INBOX_POLL);
+        self.pace.send_if_modified(|pace| {
+            let changed = pace.inbox_poll != interval;
+            pace.inbox_poll = interval;
+            changed
+        });
+    }
+
+    /// Poll the hot folders now rather than at the next tick, unless they
+    /// were polled a moment ago.
+    pub fn sync_now(&self) {
+        self.pace
+            .send_modify(|pace| pace.sync_now = pace.sync_now.wrapping_add(1));
+    }
+
+    /// The pace the sync tasks follow right now.
+    pub fn inbox_poll(&self) -> Duration {
+        self.pace.borrow().inbox_poll
     }
 
     pub async fn authenticate(&self, login: &str, password: &str) -> Option<Arc<AccountRuntime>> {

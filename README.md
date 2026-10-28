@@ -306,7 +306,9 @@ administrator revokes consent or a refresh token expires.
   (`HEADER` on arbitrary fields, keywords, literals) are refused rather than
   guessed, and `BODY`/`TEXT` only see bodies that are in the local cache. IDLE
   reacts to the sync task's polls (every `sync.inbox_poll_secs`), not to push
-  notifications from Graph.
+  notifications from Graph. A program embedding the bridge can shorten that
+  pace while its window is in use (`Runtime::set_inbox_poll`, down to 15
+  seconds) and ask for a poll outright (`Runtime::sync_now`).
 - Messages uploaded with APPEND become Outlook drafts, because that is how
   Graph creates MIME messages. APPEND to the sent folder is accepted but
   ignored, since Graph already files a copy of everything sent via SMTP.
