@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use crate::config::SyncConfig;
 use crate::graph::{
@@ -23,6 +23,32 @@ use crate::store::{Store, StoredFolder, SyncState};
 const HOT_FOLDERS: &[&str] = &["\\Inbox", "\\Sent", "\\Drafts"];
 /// Bodies prefetched per cycle when `download_bodies` is on.
 const PREFETCH_BATCH: usize = 100;
+/// The fastest the hot folders are ever polled, however the pace is set.
+pub const MIN_INBOX_POLL: Duration = Duration::from_secs(15);
+/// A `sync_now` within this long of the last hot-folder poll is ignored, so
+/// a burst of nudges costs one round of Graph requests.
+const NUDGE_GAP: Duration = Duration::from_secs(5);
+
+/// How the hot folders are polled, changeable while the bridge runs: an
+/// embedding program polls faster while someone is looking at the mailbox
+/// and asks for a poll outright when they come back to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pace {
+    /// Time between delta polls of Inbox, Sent, and Drafts.
+    pub inbox_poll: Duration,
+    /// Bumped by `Runtime::sync_now`; a sync task that sees a new value
+    /// polls the hot folders straight away.
+    pub sync_now: u64,
+}
+
+impl Pace {
+    pub fn from_config(config: &SyncConfig) -> Self {
+        Self {
+            inbox_poll: Duration::from_secs(config.inbox_poll_secs).max(MIN_INBOX_POLL),
+            sync_now: 0,
+        }
+    }
+}
 
 /// Published on the runtime's broadcast channel whenever a folder's index
 /// changed, so idling IMAP sessions can push updates promptly.
@@ -42,12 +68,19 @@ async fn run(runtime: Arc<Runtime>, account: Arc<AccountRuntime>) {
     let config = &runtime.config.sync;
     let name = account.config.name.as_str();
     let folder_poll = Duration::from_secs(config.folder_poll_secs);
-    let inbox_poll = Duration::from_secs(config.inbox_poll_secs);
+    let mut pace: watch::Receiver<Pace> = runtime.pace.subscribe();
+    let mut seen_nudge = pace.borrow().sync_now;
     let mut last_folder_refresh: Option<Instant> = None;
     let mut last_synced: HashMap<String, Instant> = HashMap::new();
     let mut backoff = Duration::from_secs(30);
     tracing::info!(account = name, "mailbox sync started");
     loop {
+        let Pace {
+            inbox_poll,
+            sync_now,
+        } = *pace.borrow_and_update();
+        let nudged = sync_now != seen_nudge;
+        seen_nudge = sync_now;
         let mut failed = false;
         if last_folder_refresh.is_none_or(|at| at.elapsed() >= folder_poll) {
             match refresh_folders(&runtime, &account).await {
@@ -70,16 +103,10 @@ async fn run(runtime: Arc<Runtime>, account: Arc<AccountRuntime>) {
                 .store
                 .sync_state(name, &folder.id)
                 .unwrap_or_default();
-            let interval = if is_hot(folder) {
-                inbox_poll
-            } else {
-                folder_poll
-            };
-            let due = !state.full_sync_done
-                || last_synced
-                    .get(&folder.id)
-                    .is_none_or(|at| at.elapsed() >= interval);
-            if !due {
+            let hot = is_hot(folder);
+            let interval = if hot { inbox_poll } else { folder_poll };
+            let since = last_synced.get(&folder.id).map(Instant::elapsed);
+            if !is_due(state.full_sync_done, hot && nudged, since, interval) {
                 continue;
             }
             match sync_folder(&runtime, &account, folder, config).await {
@@ -119,7 +146,30 @@ async fn run(runtime: Arc<Runtime>, account: Arc<AccountRuntime>) {
             backoff = Duration::from_secs(30);
             inbox_poll
         };
-        tokio::time::sleep(pause).await;
+        // A new pace cuts the wait short: the next round re-checks what is
+        // due under it.
+        tokio::select! {
+            _ = tokio::time::sleep(pause) => {}
+            changed = pace.changed() => {
+                if changed.is_err() {
+                    // The runtime, and the sender with it, is gone.
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Whether a folder last polled `since` ago (never, when None) is polled in
+/// this round. A nudge brings a hot folder forward unless it was polled a
+/// moment ago.
+fn is_due(full_sync_done: bool, nudged: bool, since: Option<Duration>, interval: Duration) -> bool {
+    if !full_sync_done {
+        return true;
+    }
+    match since {
+        None => true,
+        Some(since) => since >= interval || (nudged && since >= NUDGE_GAP),
     }
 }
 
@@ -424,6 +474,31 @@ mod tests {
         ]);
         let ids: Vec<&str> = ordered.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["inbox", "sent", "junk", "small", "big"]);
+    }
+
+    #[test]
+    fn a_folder_is_due_on_its_interval_or_a_fresh_nudge() {
+        let minute = Duration::from_secs(60);
+        assert!(is_due(false, false, Some(Duration::ZERO), minute));
+        assert!(is_due(true, false, None, minute));
+        assert!(!is_due(true, false, Some(Duration::from_secs(30)), minute));
+        assert!(is_due(true, false, Some(minute), minute));
+        assert!(is_due(true, true, Some(Duration::from_secs(30)), minute));
+        assert!(!is_due(true, true, Some(Duration::from_secs(2)), minute));
+    }
+
+    #[test]
+    fn the_configured_pace_never_goes_under_the_floor() {
+        let fast = SyncConfig {
+            inbox_poll_secs: 1,
+            ..Default::default()
+        };
+        assert_eq!(Pace::from_config(&fast).inbox_poll, MIN_INBOX_POLL);
+        let slow = SyncConfig {
+            inbox_poll_secs: 90,
+            ..Default::default()
+        };
+        assert_eq!(Pace::from_config(&slow).inbox_poll, Duration::from_secs(90));
     }
 
     #[test]

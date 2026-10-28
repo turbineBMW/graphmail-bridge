@@ -321,11 +321,12 @@ impl Config {
         if !(1..=500).contains(&self.sync.page_size) {
             bail!("sync.page_size must be between 1 and 500");
         }
-        if self.sync.inbox_poll_secs < 15
-            || self.sync.folder_poll_secs < 15
-            || self.sync.calendar_poll_secs < 15
+        let floor = crate::sync::MIN_INBOX_POLL.as_secs();
+        if self.sync.inbox_poll_secs < floor
+            || self.sync.folder_poll_secs < floor
+            || self.sync.calendar_poll_secs < floor
         {
-            bail!("sync poll intervals must be at least 15 seconds");
+            bail!("sync poll intervals must be at least {floor} seconds");
         }
         if self.sync.body_cache_max_mb < 64 {
             bail!("sync.body_cache_max_mb must be at least 64");
