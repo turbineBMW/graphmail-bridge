@@ -14,7 +14,16 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::graph::{FollowupFlag, MailFolder, MessageSummary, Recipient};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+
+/// Eviction runs once the body cache outgrows its cap and stops at this
+/// share of it, so a cache at its cap doesn't evict on every single store.
+const EVICTION_TARGET_PERCENT: u64 = 90;
+
+/// How long a cached body's `last_access` stamp stays put after a read.
+/// Updating it rewrites the row, MIME blob and all, so it isn't worth
+/// doing for every read of a body that was read a moment ago.
+const ACCESS_STAMP_INTERVAL: i64 = 60 * 60;
 
 pub struct Store {
     connection: Mutex<Connection>,
@@ -608,20 +617,24 @@ impl Store {
 
     pub fn body_get(&self, account: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
         let connection = self.lock();
-        let body: Option<Vec<u8>> = connection
+        let hit: Option<(Vec<u8>, i64)> = connection
             .query_row(
-                "SELECT mime FROM body_cache WHERE account=?1 AND message_id=?2",
+                "SELECT mime, last_access FROM body_cache WHERE account=?1 AND message_id=?2",
                 params![account, message_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if body.is_some() {
+        let Some((body, last_access)) = hit else {
+            return Ok(None);
+        };
+        let now = now();
+        if now - last_access >= ACCESS_STAMP_INTERVAL {
             connection.execute(
                 "UPDATE body_cache SET last_access=?3 WHERE account=?1 AND message_id=?2",
-                params![account, message_id, now()],
+                params![account, message_id, now],
             )?;
         }
-        Ok(body)
+        Ok(Some(body))
     }
 
     pub fn body_cached(&self, account: &str, message_id: &str) -> Result<bool> {
@@ -636,8 +649,14 @@ impl Store {
             .is_some())
     }
 
-    /// Cache a message's MIME, then evict least-recently-used bodies until the
-    /// cache fits in `max_bytes`. Bodies larger than the cap are not stored.
+    /// Cache a message's MIME. When that takes the cache past `max_bytes`,
+    /// evict least-recently-used bodies until it is back under
+    /// `EVICTION_TARGET_PERCENT` of the cap. Bodies larger than the cap are
+    /// not stored.
+    ///
+    /// The accounting reads only the `body_cache_accounting` index. A
+    /// table row's `size` sits behind its MIME blob, so summing it through
+    /// the table would walk every overflow page of the whole cache.
     pub fn body_put(
         &self,
         account: &str,
@@ -670,25 +689,34 @@ impl Store {
             transaction.query_row("SELECT COALESCE(SUM(size), 0) FROM body_cache", [], |row| {
                 row.get(0)
             })?;
-        let mut excess = (total.max(0) as u64).saturating_sub(max_bytes);
-        if excess > 0 {
-            // Walk least-recently-used rows and drop just enough to fit.
-            let victims: Vec<(i64, i64)> = {
+        if total.max(0) as u64 > max_bytes {
+            let kept: i64 = transaction.query_row(
+                "SELECT rowid FROM body_cache WHERE account=?1 AND message_id=?2",
+                params![account, message_id],
+                |row| row.get(0),
+            )?;
+            let mut excess = (total as u64).saturating_sub(eviction_target(max_bytes));
+            // Walk least-recently-used rows and take just enough to fit.
+            let victims: Vec<i64> = {
                 let mut statement = transaction.prepare(
-                    "SELECT rowid, size FROM body_cache WHERE NOT (account=?1 AND message_id=?2)
-                     ORDER BY last_access ASC",
+                    "SELECT rowid, size FROM body_cache WHERE rowid != ?1 ORDER BY last_access ASC",
                 )?;
-                let rows = statement.query_map(params![account, message_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
+                let rows = statement.query_map(params![kept], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
                 })?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()?
-            };
-            for (rowid, size) in victims {
-                if excess == 0 {
-                    break;
+                let mut victims = Vec::new();
+                for row in rows {
+                    if excess == 0 {
+                        break;
+                    }
+                    let (rowid, size) = row?;
+                    victims.push(rowid);
+                    excess = excess.saturating_sub(size.max(0) as u64);
                 }
+                victims
+            };
+            for rowid in victims {
                 transaction.execute("DELETE FROM body_cache WHERE rowid=?1", params![rowid])?;
-                excess = excess.saturating_sub(size.max(0) as u64);
             }
         }
         transaction.commit()?;
@@ -814,7 +842,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
              last_access INTEGER NOT NULL,
              PRIMARY KEY (account, message_id)
          );
-         CREATE INDEX IF NOT EXISTS body_cache_lru ON body_cache(last_access);
+         CREATE INDEX IF NOT EXISTS body_cache_accounting ON body_cache(last_access, size);
          CREATE TABLE IF NOT EXISTS calendars (
              account TEXT NOT NULL,
              calendar_id TEXT NOT NULL,
@@ -862,6 +890,11 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.execute_batch("ALTER TABLE messages ADD COLUMN pinned INTEGER;")?;
     }
     // v3 only adds the calendar tables, which the batch above creates.
+    if version < 4 {
+        // v4: the LRU index also carries `size`, so cache accounting never
+        // reads the blob rows; the old index is a subset of it.
+        transaction.execute_batch("DROP INDEX IF EXISTS body_cache_lru;")?;
+    }
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
@@ -917,6 +950,12 @@ fn new_uid_validity() -> u32 {
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+/// Where an eviction stops: a little under the cap, so the next few stores
+/// fit without evicting again.
+fn eviction_target(max_bytes: u64) -> u64 {
+    max_bytes / 100 * EVICTION_TARGET_PERCENT
 }
 
 fn epoch_seconds(rfc3339: &str) -> Option<i64> {
@@ -1207,6 +1246,82 @@ mod tests {
         // Oversized bodies are skipped rather than thrashing the cache.
         store.body_put("work", "big", &vec![0; 5000], 2500).unwrap();
         assert!(!store.body_cached("work", "big").unwrap());
+    }
+
+    #[test]
+    fn body_cache_eviction_leaves_headroom() {
+        let (_temporary, store) = store();
+        let body = vec![b'x'; 100];
+        // 1000-byte cap: the eleventh body tips it over; eviction stops at 900.
+        for id in 0..11 {
+            store
+                .body_put("work", &id.to_string(), &body, 1000)
+                .unwrap();
+        }
+        let (bytes, rows) = store.body_cache_stats().unwrap();
+        assert_eq!((bytes, rows), (900, 9));
+        assert!(!store.body_cached("work", "0").unwrap());
+        assert!(!store.body_cached("work", "1").unwrap());
+        assert!(store.body_cached("work", "10").unwrap());
+        // The next store fits in the headroom without evicting anything.
+        store.body_put("work", "11", &body, 1000).unwrap();
+        assert_eq!(store.body_cache_stats().unwrap(), (1000, 10));
+        assert!(store.body_cached("work", "2").unwrap());
+    }
+
+    #[test]
+    fn body_cache_accounting_reads_only_its_index() {
+        let (_temporary, store) = store();
+        store
+            .body_put("work", "a", b"Subject: x\r\n\r\nbody", 1 << 20)
+            .unwrap();
+        let connection = store.lock();
+        for sql in [
+            "SELECT COALESCE(SUM(size), 0) FROM body_cache",
+            "SELECT rowid, size FROM body_cache WHERE rowid != 1 ORDER BY last_access ASC",
+        ] {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let plan: Vec<String> = statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("COVERING INDEX body_cache_accounting")),
+                "{sql}: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn body_reads_stamp_access_at_most_hourly() {
+        let (_temporary, store) = store();
+        store
+            .body_put("work", "a", b"Subject: x\r\n\r\nbody", 1 << 20)
+            .unwrap();
+        let stamp = |store: &Store| -> i64 {
+            store
+                .lock()
+                .query_row(
+                    "SELECT last_access FROM body_cache WHERE message_id='a'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let stored = stamp(&store);
+        assert!(store.body_get("work", "a").unwrap().is_some());
+        assert_eq!(stamp(&store), stored, "a fresh stamp is left alone");
+        let stale = stored - ACCESS_STAMP_INTERVAL - 1;
+        store
+            .lock()
+            .execute("UPDATE body_cache SET last_access=?1", params![stale])
+            .unwrap();
+        assert!(store.body_get("work", "a").unwrap().is_some());
+        assert!(stamp(&store) >= stored, "a stale stamp is refreshed");
     }
 
     #[test]
