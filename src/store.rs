@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::graph::{FollowupFlag, MailFolder, MessageSummary, Recipient};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Eviction runs once the body cache outgrows its cap and stops at this
 /// share of it, so a cache at its cap doesn't evict on every single store.
@@ -293,6 +293,52 @@ impl Store {
                     removed: None,
                     stored_size: row.get::<_, Option<i64>>(12)?.map(|size| size as u64),
                     stored_pinned: Some(row.get::<_, Option<bool>>(14)?.unwrap_or(false)),
+                    single_value_extended_properties: Vec::new(),
+                },
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// What an IMAP session keeps of every message in a folder, oldest UID
+    /// first: identity, flags, size and dates, and none of the text. A
+    /// session lists its mailbox on every SELECT and again whenever it
+    /// checks for changes, so this reads only the `messages_session` index;
+    /// the table's rows, with their subjects and previews, are several
+    /// times the work for a large folder. The fields left out come back
+    /// empty.
+    pub fn list_session(&self, account: &str, mailbox_id: &str) -> Result<Vec<StoredMessage>> {
+        let connection = self.lock();
+        let mut statement = connection.prepare_cached(
+            "SELECT message_id, uid, is_read, is_draft, flagged, pinned, size,
+                    received_raw, sent_raw
+             FROM messages INDEXED BY messages_session
+             WHERE account=?1 AND mailbox_id=?2 ORDER BY uid",
+        )?;
+        let rows = statement.query_map(params![account, mailbox_id], |row| {
+            let flagged: bool = row.get(4)?;
+            Ok(StoredMessage {
+                uid: row.get(1)?,
+                summary: MessageSummary {
+                    id: row.get(0)?,
+                    subject: None,
+                    received_date_time: row.get(7)?,
+                    sent_date_time: row.get(8)?,
+                    is_read: row.get(2)?,
+                    has_attachments: false,
+                    internet_message_id: None,
+                    is_draft: row.get(3)?,
+                    flag: Some(FollowupFlag {
+                        flag_status: if flagged { "flagged" } else { "notFlagged" }.to_owned(),
+                    }),
+                    from: None,
+                    to_recipients: Vec::new(),
+                    cc_recipients: Vec::new(),
+                    bcc_recipients: Vec::new(),
+                    body_preview: None,
+                    removed: None,
+                    stored_size: row.get::<_, Option<i64>>(6)?.map(|size| size as u64),
+                    stored_pinned: Some(row.get::<_, Option<bool>>(5)?.unwrap_or(false)),
                     single_value_extended_properties: Vec::new(),
                 },
             })
@@ -811,6 +857,9 @@ fn migrate(connection: &mut Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS messages_order ON messages(account, mailbox_id, uid);
          CREATE INDEX IF NOT EXISTS messages_received ON messages(account, mailbox_id, received_at);
+         CREATE INDEX IF NOT EXISTS messages_session ON messages(
+             account, mailbox_id, uid, message_id, is_read, is_draft, flagged, pinned, size,
+             received_raw, sent_raw);
          CREATE TABLE IF NOT EXISTS folders (
              account TEXT NOT NULL,
              folder_id TEXT NOT NULL,
@@ -890,6 +939,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.execute_batch("ALTER TABLE messages ADD COLUMN pinned INTEGER;")?;
     }
     // v3 only adds the calendar tables, which the batch above creates.
+    // v5 only adds the `messages_session` index, likewise.
     if version < 4 {
         // v4: the LRU index also carries `size`, so cache accounting never
         // reads the blob rows; the old index is a subset of it.
@@ -1267,6 +1317,72 @@ mod tests {
         store.body_put("work", "11", &body, 1000).unwrap();
         assert_eq!(store.body_cache_stats().unwrap(), (1000, 10));
         assert!(store.body_cached("work", "2").unwrap());
+    }
+
+    #[test]
+    fn a_session_listing_matches_the_full_one_and_reads_only_its_index() {
+        let (_temporary, store) = store();
+        let messages = [
+            summary(
+                r#"{"id":"a","subject":"One","isRead":false,
+                    "receivedDateTime":"2020-01-02T03:04:05Z","bodyPreview":"Preview"}"#,
+            ),
+            summary(
+                r#"{"id":"b","subject":"Two","isRead":true,"isDraft":true,
+                    "flag":{"flagStatus":"flagged"},"sentDateTime":"2020-01-03T03:04:05Z"}"#,
+            ),
+        ];
+        store.upsert_messages("work", "inbox", &messages).unwrap();
+        store.set_sizes("work", &[("a".to_owned(), 1234)]).unwrap();
+        store
+            .set_pinned_messages("work", "inbox", &["b".to_owned()])
+            .unwrap();
+        let full = store.list_mailbox("work", "inbox").unwrap();
+        let session = store.list_session("work", "inbox").unwrap();
+        assert_eq!(session.len(), 2);
+        for (full, session) in full.iter().zip(&session) {
+            assert_eq!(session.uid, full.uid);
+            let (full, session) = (&full.summary, &session.summary);
+            assert_eq!(session.id, full.id);
+            assert_eq!(session.is_read, full.is_read);
+            assert_eq!(session.is_draft, full.is_draft);
+            assert_eq!(session.is_flagged(), full.is_flagged());
+            assert_eq!(session.is_pinned(), full.is_pinned());
+            assert_eq!(session.size(), full.size());
+            assert_eq!(session.received_date_time, full.received_date_time);
+            assert_eq!(session.sent_date_time, full.sent_date_time);
+            assert_eq!(session.subject, None);
+        }
+
+        let connection = store.lock();
+        for sql in [
+            "SELECT message_id, uid, is_read, is_draft, flagged, pinned, size, received_raw,
+                    sent_raw
+             FROM messages INDEXED BY messages_session
+             WHERE account='work' AND mailbox_id='inbox' ORDER BY uid",
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN is_read THEN 0 ELSE 1 END), 0)
+             FROM messages WHERE account='work' AND mailbox_id='inbox'",
+            "SELECT COUNT(*) FROM messages
+             WHERE account='work' AND mailbox_id='inbox' AND size IS NULL",
+        ] {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let plan: Vec<String> = statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("COVERING INDEX messages_session")),
+                "{sql}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+                "{sql}: {plan:?}"
+            );
+        }
     }
 
     #[test]
