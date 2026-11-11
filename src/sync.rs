@@ -25,6 +25,10 @@ const HOT_FOLDERS: &[&str] = &["\\Inbox", "\\Sent", "\\Drafts"];
 const PREFETCH_BATCH: usize = 100;
 /// The fastest the hot folders are ever polled, however the pace is set.
 pub const MIN_INBOX_POLL: Duration = Duration::from_secs(15);
+/// The pinned set of a folder is re-read at most this often. Delta can't
+/// report a pin, so each read is a Graph request of its own: at the fast
+/// inbox pace that doubled the requests of a round in which nothing changed.
+const PIN_POLL: Duration = Duration::from_secs(60);
 /// A `sync_now` within this long of the last hot-folder poll is ignored, so
 /// a burst of nudges costs one round of Graph requests.
 const NUDGE_GAP: Duration = Duration::from_secs(5);
@@ -72,6 +76,7 @@ async fn run(runtime: Arc<Runtime>, account: Arc<AccountRuntime>) {
     let mut seen_nudge = pace.borrow().sync_now;
     let mut last_folder_refresh: Option<Instant> = None;
     let mut last_synced: HashMap<String, Instant> = HashMap::new();
+    let mut last_pins: HashMap<String, Instant> = HashMap::new();
     let mut backoff = Duration::from_secs(30);
     tracing::info!(account = name, "mailbox sync started");
     loop {
@@ -115,8 +120,14 @@ async fn run(runtime: Arc<Runtime>, account: Arc<AccountRuntime>) {
                     if let Err(error) = backfill_sizes(&runtime, &account, folder, config).await {
                         tracing::debug!(account = name, folder = %folder.display_name, %error, "size backfill failed");
                     }
-                    if let Err(error) = refresh_pins(&runtime, &account, folder, config).await {
-                        tracing::debug!(account = name, folder = %folder.display_name, %error, "pin refresh failed");
+                    if last_pins
+                        .get(&folder.id)
+                        .is_none_or(|at| at.elapsed() >= PIN_POLL)
+                    {
+                        last_pins.insert(folder.id.clone(), Instant::now());
+                        if let Err(error) = refresh_pins(&runtime, &account, folder, config).await {
+                            tracing::debug!(account = name, folder = %folder.display_name, %error, "pin refresh failed");
+                        }
                     }
                 }
                 Err(error) => {

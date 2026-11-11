@@ -590,7 +590,7 @@ async fn list_messages(
     allow_bootstrap: bool,
 ) -> Result<(Vec<SelectedMessage>, bool)> {
     let account_name = account.config.name.as_str();
-    let stored = runtime.store.list_mailbox(account_name, mailbox_id)?;
+    let stored = runtime.store.list_session(account_name, mailbox_id)?;
     let synced = runtime
         .store
         .sync_state(account_name, mailbox_id)?
